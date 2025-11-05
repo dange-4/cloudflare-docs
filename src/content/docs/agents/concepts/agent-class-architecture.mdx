@@ -1,0 +1,560 @@
+---
+title: Agent class architecture
+pcx_content_type: concept
+sidebar:
+  order: 10
+---
+
+import { TypeScriptExample } from "~/components";
+
+The core of the Agents SDK is the exported `Agent` class. Following the pattern from Durable Objects, the main API for developers is to extend the `Agent` class so that your classes inherit all the built-in features. While this is a supercharged primitive that allows developers to write only the logic they need, it can obscure the inner workings.
+
+This guide helps you understand the architecture of the `Agent` class, empowering you to get the full picture and avoid common pitfalls when building agents.
+
+## What is the Agent class?
+
+The `Agent` class is an extension of `DurableObject`. That is to say, Agents _are_ **Durable Objects**. If you're not familiar with Durable Objects, read [What are Durable Objects](/durable-objects/) to learn more. At their core, Durable Objects are globally addressable (each instance has a unique ID) single-threaded compute instances with long-term storage (KV/SQLite).
+
+However, `Agent` does **not** extend `DurableObject` directly. Instead, it extends `Server`, which is a class provided by [PartyKit](https://github.com/cloudflare/partykit/tree/main/packages/partyserver).
+
+You can visualize the architecture as layers: **DurableObject** → **Server** → **Agent**.
+
+## Layer 0: Durable Object
+
+This section won't cover Durable Objects in detail, but it's helpful to understand what primitives Durable Objects expose so you can understand how the outer layers use them.
+
+### Constructor
+
+```ts
+constructor(ctx: DurableObjectState, env: Env) {}
+```
+
+The Workers runtime always calls the constructor to handle things internally. This means:
+
+1. While the constructor is called every time the Durable Object is initialized, the signature is fixed. Developers **cannot add or update parameters in the constructor**.
+2. Instead of instantiating the class manually, developers must use the binding APIs through the [DurableObjectNamespace](/durable-objects/api/namespace/).
+
+### RPC
+
+By writing a Durable Object class which inherits from the built-in `DurableObject` type, public methods on the Durable Object class are exposed as RPC methods, which developers can call using a DurableObjectStub from a Worker.
+
+<TypeScriptExample>
+
+```ts
+// This instance could've been active, hibernated,
+// not initialized, or maybe had never even been created!
+const stub = env.MY_DO.getByName("foo");
+
+// We can call any public method of the class. The runtime
+// ensures the constructor is called for us if the instance wasn't active.
+await stub.bar();
+```
+
+</TypeScriptExample>
+
+### fetch()
+
+Durable Objects can accept a `Request` from a Worker and send a `Response` back. This can **only** be done through the [`fetch`](/durable-objects/best-practices/create-durable-object-stubs-and-send-requests/#invoking-the-fetch-handler) method (which you must implement).
+
+### WebSockets
+
+Durable Objects include first-class support for [WebSockets](/durable-objects/best-practices/websockets/). A Durable Object can accept a WebSocket it receives from a `Request` in `fetch`. The base class provides methods that developers can implement as callbacks, effectively replacing the need for event listeners.
+
+The base class provides `webSocketMessage(ws, message)`, `webSocketClose(ws, code, reason, wasClean)`, and `webSocketError(ws, error)`.
+
+<TypeScriptExample>
+
+```ts
+export class MyDurableObject extends DurableObject {
+  async fetch(request) {
+    // Creates two ends of a WebSocket connection.
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+
+    // Calling `acceptWebSocket()` connects the WebSocket to the Durable Object
+    this.ctx.acceptWebSocket(server);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client
+    });
+  }
+
+  async webSocketMessage(ws, message) {
+    // Echo back the messages
+    ws.send(message);
+  }
+}
+```
+
+</TypeScriptExample>
+
+### alarm()
+
+HTTP and RPC requests are not the only entry points for a Durable Object. Alarms allow developers to schedule tasks to run at a later time. When the runtime knows an alarm is due, it calls the `alarm()` method, which you implement.
+
+To schedule an alarm, use the `this.ctx.storage.setAlarm()` method. For more information, refer to the [Alarms API documentation](/durable-objects/api/alarms/).
+
+### this.ctx
+
+The base `DurableObject` class sets the [DurableObjectState](/durable-objects/api/state/) into `this.ctx`. There are many interesting methods and properties, but this guide focuses on `this.ctx.storage`.
+
+### this.ctx.storage
+
+[DurableObjectStorage](/durable-objects/api/sqlite-storage-api/) is the main interface with the Durable Object's persistence mechanisms, which include both a KV and SQLite **synchronous** APIs.
+
+<TypeScriptExample>
+
+```ts
+const sql = this.ctx.storage.sql;
+const kv = this.ctx.storage.kv;
+
+// An example of a synchronous SQL query
+const rows = sql.exec("SELECT * FROM contacts WHERE country = ?", "US");
+
+// An example of the synchronous KV
+const token = kv.get("someToken");
+```
+
+</TypeScriptExample>
+
+### this.env
+
+The Durable Object also has the Worker `Env` available in `this.env`.
+
+## Layer 1: PartyKit Server
+
+Now that you've seen what Durable Objects provide, what [PartyKit](https://github.com/cloudflare/partykit)'s `Server` (package `partyserver`) implements will be clearer. It's an **opinionated `DurableObject` wrapper that improves developer experience by providing developer-friendly callbacks** instead of requiring you to work directly with Durable Object primitives.
+
+An important note: `Server` **does not use any of the Durable Object storage**, so you will not see extra storage operations.
+
+### Addressing
+
+PartyKit's `partyserver` exposes helpers to address your Durable Objects instead of manually using your bindings. This allows `partyserver` to implement several improvements, including a URL routing scheme for your Durable Objects (for example, `<your-worker>/servers/:durableClass/:durableName`).
+
+Compare this to the Durable Object addressing example above:
+
+<TypeScriptExample>
+
+```ts
+// Note the await here!
+const stub = await getServerByName(env.MY_DO, "foo");
+
+// We can still call RPC methods
+await stub.bar();
+```
+
+</TypeScriptExample>
+
+Since PartyKit provides a URL addressing scheme, you also get access to `routePartykitRequest()`:
+
+<TypeScriptExample>
+
+```ts
+async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  // Behind the scenes, PartyKit normalizes your Durable Object binding names
+  // and tries to do some pattern matching
+  const res = await routePartykitRequest(request, env);
+
+  if (res) return res;
+
+  return new Response("Not found", { status: 404 });
+}
+```
+
+</TypeScriptExample>
+
+### onStart
+
+The extra addressing functionality that `Server` includes allows it to expose an `onStart` callback that is **executed every time the Durable Object starts up** (when the Durable Object was evicted, hibernated, or never created) and **before any `fetch` or RPC calls**.
+
+<TypeScriptExample>
+
+```ts
+class MyServer extends Server {
+  onStart() {
+    // Some initialization logic you want to run every time
+    // the Durable Object starts up
+    const sql = this.ctx.storage.sql;
+    sql.exec(`...`);
+  }
+}
+```
+
+</TypeScriptExample>
+
+### onRequest and onConnect
+
+`Server` already implements `fetch` for the underlying Durable Object and exposes two different callbacks that developers can use: `onRequest` and `onConnect` for HTTP requests and incoming WebSocket connections, respectively. **WebSocket connections are accepted by default.**
+
+<TypeScriptExample>
+
+```ts
+class MyServer extends Server {
+  async onRequest(request: Request) {
+    const url = new URL(request.url);
+
+    return new Response(`Hello from ${url.origin}!`);
+  }
+
+  async onConnect(conn, ctx) {
+    const { request } = ctx;
+    const url = new URL(request.url);
+
+    // Connections are a WebSocket wrapper
+    conn.send(`Hello from ${url.origin}!`);
+  }
+}
+```
+
+</TypeScriptExample>
+
+### WebSockets
+
+Just as `onConnect` is the callback for every new connection, `Server` also provides wrappers on top of the default callbacks from the `DurableObject` class: `onMessage`, `onClose`, and `onError`.
+
+There's also `this.broadcast`, which sends a WebSocket message to all connected clients (implemented as a loop over `this.getConnections()`).
+
+### this.name
+
+It can be difficult to get a Durable Object's `name` from within it. `partyserver` tries to make it available in `this.name`, but it's not a perfect solution. Read more about this [limitation](https://github.com/cloudflare/workerd/issues/2240).
+
+## Layer 2: Agent
+
+Finally, the `Agent` class. `Agent` extends `Server` and provides opinionated primitives for stateful, schedulable, and observable agents that can communicate via RPC, WebSockets, and email.
+
+### Automatic state persistence
+
+One of the core features of `Agent` is **automatic state persistence**. Developers define the shape of their state via the generic parameter and `initialState` (which is only used if no state exists in storage), and the Agent handles loading, saving, and broadcasting state changes.
+
+`this.state` is a getter that lazily loads state from storage (SQL). **State is persisted across Durable Object evictions** when updated with `this.setState()`, which automatically writes back to storage.
+
+You can override `this.onStateUpdate` to react to state changes.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent<Env, { count: number }> {
+  initialState = { count: 0 };
+
+  increment() {
+    this.setState({ count: this.state.count + 1 });
+  }
+
+  onStateUpdate(state, source) {
+    console.log("State updated:", state);
+  }
+}
+```
+
+</TypeScriptExample>
+
+State is stored in the `cf_agents_state` SQL table. State messages are sent with `type: "cf_agent_state"` (from both client and server). Since the Agents SDK provides JavaScript and React clients, real-time state updates are available out of the box.
+
+For more information, refer to [Managing and syncing state](/agents/api-reference/store-and-sync-state/).
+
+### SQL template tag
+
+The Agent provides a convenient `sql` template tag for executing queries against the Durable Object's SQL storage. It constructs parameterized queries and executes them using the **synchronous** SQL API from `this.ctx.storage.sql`.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  onStart() {
+    this.sql`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT
+      )
+    `;
+
+    const userId = "1";
+    const userName = "Alice";
+    this.sql`INSERT INTO users (id, name) VALUES (${userId}, ${userName})`;
+
+    const users = this.sql<{ id: string; name: string }>`
+      SELECT * FROM users WHERE id = ${userId}
+    `;
+    console.log(users); // [{ id: "1", name: "Alice" }]
+  }
+}
+```
+
+</TypeScriptExample>
+
+For more information, refer to the [SQL API documentation](/agents/api-reference/agents-api/#sql-api).
+
+### RPC and callable methods
+
+Agents extend Durable Objects RPC by implementing RPC through WebSockets, so clients can call methods on the Agent directly. To make a method callable, use the `@callable` decorator. Methods can return a value or a stream.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  @callable({ description: "Add two numbers" })
+  async add(a: number, b: number) {
+    return a + b;
+  }
+}
+```
+
+</TypeScriptExample>
+
+Clients can invoke this method by sending a WebSocket message:
+
+```json
+{
+  "type": "rpc",
+  "id": "unique-request-id",
+  "method": "add",
+  "args": [2, 3]
+}
+```
+
+For example, with the provided React client:
+
+<TypeScriptExample>
+
+```ts
+const { stub } = useAgent({ name: "my-agent" });
+const result = await stub.add(2, 3);
+console.log(result); // 5
+```
+
+</TypeScriptExample>
+
+For more information, refer to the [Calling Agents documentation](/agents/api-reference/calling-agents/).
+
+### Task queue
+
+Agents include a built-in task queue for deferred execution. This is useful for offloading work or retrying operations. The available methods are `this.queue`, `this.dequeue`, `this.dequeueAll`, `this.dequeueAllByCallback`, `this.getQueue`, and `this.getQueues`.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  async onConnect() {
+    // Queue a task to be executed later
+    await this.queue("processTask", { userId: "123" });
+  }
+
+  async processTask(payload: { userId: string }, queueItem: QueueItem) {
+    console.log("Processing task for user:", payload.userId);
+  }
+}
+```
+
+</TypeScriptExample>
+
+Tasks are stored in the `cf_agents_queues` SQL table and are automatically flushed in sequence. If a task succeeds, it's automatically dequeued.
+
+### Scheduling
+
+Agents support scheduled execution of methods by wrapping the Durable Object's `alarm()` API. The available methods are `this.schedule`, `this.getSchedule`, `this.getSchedules`, and `this.cancelSchedule`. Schedules can be one-time, delayed, or recurring (using cron expressions).
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  async onStart() {
+    // Schedule at a specific time
+    await this.schedule(new Date("2025-12-25T00:00:00Z"), "sendGreeting", {
+      message: "Merry Christmas!"
+    });
+
+    // Schedule with a delay (in seconds)
+    await this.schedule(60, "checkStatus", { check: "health" });
+
+    // Schedule with a cron expression
+    await this.schedule("0 0 * * *", "dailyTask", { type: "cleanup" });
+  }
+
+  async sendGreeting(payload: { message: string }) {
+    console.log(payload.message);
+  }
+
+  async checkStatus(payload: { check: string }) {
+    console.log("Running check:", payload.check);
+  }
+
+  async dailyTask(payload: { type: string }) {
+    console.log("Daily task:", payload.type);
+  }
+}
+```
+
+</TypeScriptExample>
+
+Schedules are stored in the `cf_agents_schedules` SQL table. Cron schedules automatically reschedule themselves after execution, while one-time schedules are deleted.
+
+For more information, refer to the [Schedule tasks documentation](/agents/api-reference/schedule-tasks/).
+
+### MCP client
+
+`Agent` includes a multi-server MCP (Model Context Protocol) client. This enables your Agent to interact with external services that expose MCP interfaces.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  async onConnect() {
+    // Add an MCP server
+    await this.addMcpServer(
+      "GitHub",
+      "https://mcp.example.com/sse",
+      "https://my-worker.example.workers.dev", // callback host for OAuth
+      "agents" // routing prefix
+    );
+  }
+}
+```
+
+</TypeScriptExample>
+
+For more information, refer to the [MCP Client API documentation](/agents/model-context-protocol/mcp-client-api/).
+
+### Email handling
+
+Agents can receive and reply to emails using Cloudflare's Email Routing.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  async onEmail(email: AgentEmail) {
+    console.log("Received email from:", email.from);
+    console.log("Subject:", email.headers.get("subject"));
+
+    const raw = await email.getRaw();
+    console.log("Raw email size:", raw.length);
+
+    // Reply to the email
+    await this.replyToEmail(email, {
+      fromName: "My Agent",
+      subject: "Re: " + email.headers.get("subject"),
+      body: "Thanks for your email!",
+      contentType: "text/plain"
+    });
+  }
+}
+```
+
+</TypeScriptExample>
+
+To route emails to your Agent, use `routeAgentEmail` in your Worker's email handler:
+
+<TypeScriptExample>
+
+```ts
+export default {
+  async email(message, env, ctx) {
+    await routeAgentEmail(message, env, {
+      resolver: createAddressBasedEmailResolver("my-agent")
+    });
+  }
+};
+```
+
+</TypeScriptExample>
+
+### Context management
+
+The Agents SDK wraps all your methods with an `AsyncLocalStorage` context to maintain information throughout the request lifecycle. This allows you to access the current agent, connection, request, or email from anywhere in your code:
+
+<TypeScriptExample>
+
+```ts
+import { getCurrentAgent } from "agents";
+
+function someUtilityFunction() {
+  const { agent, connection, request, email } = getCurrentAgent();
+
+  if (agent) {
+    console.log("Current agent:", agent.name);
+  }
+
+  if (connection) {
+    console.log("WebSocket connection ID:", connection.id);
+  }
+}
+```
+
+</TypeScriptExample>
+
+### Error handling
+
+`Agent` extends `Server`'s `onError` so it can handle errors that are not necessarily WebSocket errors. It is called with a `Connection` or `unknown` error.
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  onError(connectionOrError: Connection | unknown, error?: unknown) {
+    if (error) {
+      // WebSocket connection error
+      console.error("Connection error:", error);
+    } else {
+      // Server error
+      console.error("Server error:", connectionOrError);
+    }
+
+    // Optionally throw to propagate the error
+    throw connectionOrError;
+  }
+}
+```
+
+</TypeScriptExample>
+
+### Cleanup and destruction
+
+`destroy()` drops all tables, deletes alarms, clears storage, and aborts the context. The `this.abort` method called by `this.destroy` comes from `DurableObject` and ensures that the Agent is fully evicted. It throws an uncatchable error that will show up in your logs (this is expected behavior).
+
+<TypeScriptExample>
+
+```ts
+class MyAgent extends Agent {
+  async onStart() {
+    console.log("Agent is starting up...");
+    // Initialize your agent
+  }
+
+  async cleanup() {
+    // This wipes everything!
+    await this.destroy();
+  }
+}
+```
+
+</TypeScriptExample>
+
+### Routing
+
+The `Agent` class re-exports PartyKit's addressing helpers as `getAgentByName` and `routeAgentRequest`.
+
+<TypeScriptExample>
+
+```ts
+// Same API as getServerByName
+const stub = await getAgentByName(env.MY_DO, "foo");
+
+// Same API as routeServerRequest
+const res = await routeAgentRequest(request, env);
+
+if (res) return res;
+
+return new Response("Not found", { status: 404 });
+```
+
+</TypeScriptExample>
+
+## Next steps
+
+Now that you understand the architecture of the Agent class, explore these resources:
+
+- [Agents API reference](/agents/api-reference/agents-api/) - Complete API documentation
+- [Managing and syncing state](/agents/api-reference/store-and-sync-state/) - Learn about state management
+- [Schedule tasks](/agents/api-reference/schedule-tasks/) - Learn about scheduling
+- [MCP Client API](/agents/model-context-protocol/mcp-client-api/) - Learn about MCP integration
