@@ -1,4 +1,4 @@
-# Cloudflare Docs
+# Cloudflare Doc
 
 **[View the docs →](https://developers.cloudflare.com/)**
 
